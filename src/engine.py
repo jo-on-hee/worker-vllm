@@ -250,6 +250,7 @@ class OpenAIvLLMEngine(vLLMEngine):
         
         self.chat_engine = OpenAIServingChat(
             engine_client=self.llm, 
+            openai_serving_render=None,
             models=self.serving_models,
             response_role=self.response_role,
             request_logger=None,
@@ -267,6 +268,7 @@ class OpenAIvLLMEngine(vLLMEngine):
         )
         self.completion_engine = OpenAIServingCompletion(
             engine_client=self.llm,
+            openai_serving_render=None,
             models=self.serving_models,
             request_logger=None,
             return_tokens_as_token_ids=os.getenv('RETURN_TOKENS_AS_TOKEN_IDS', 'false').lower() == 'true',
