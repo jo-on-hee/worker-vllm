@@ -330,7 +330,9 @@ class OpenAIvLLMEngine(vLLMEngine):
         self.completion_engine = OpenAIServingCompletion(**completion_kwargs)
 
         if hasattr(self.chat_engine, 'warmup'):
-            await self.chat_engine.warmup()
+            result = self.chat_engine.warmup()
+            if result is not None and asyncio.iscoroutine(result):
+                await result
 
     async def generate(self, openai_request: JobInput):
         # Ensure engines are ready (no-op if already initialized at startup)
