@@ -16,10 +16,19 @@ from vllm.entrypoints.openai.engine.protocol import ErrorResponse
 from vllm.entrypoints.openai.models.protocol import BaseModelPath, LoRAModulePath
 from vllm.entrypoints.openai.models.serving import OpenAIServingModels
 
+try:
+    from vllm.entrypoints.openai.serving_render import OpenAIServingRender
+except ImportError:
+    try:
+        from vllm.entrypoints.serve.render.serving import OpenAIServingRender
+    except ImportError:
+        OpenAIServingRender = None
+
 from constants import DEFAULT_BATCH_SIZE, DEFAULT_BATCH_SIZE_GROWTH_FACTOR, DEFAULT_MAX_CONCURRENCY, DEFAULT_MIN_BATCH_SIZE
 from engine_args import get_engine_args
 from tokenizer import TokenizerWrapper
 from utils import BatchSize, DummyRequest, JobInput, create_error_response
+
 
 class vLLMEngine:
     def __init__(self, engine = None):
@@ -180,11 +189,6 @@ class OpenAIvLLMEngine(vLLMEngine):
         self.lora_adapters = self._load_lora_adapters()
 
         # Always defer OpenAI engine initialization to the first request.
-        # asyncio.run() creates a temporary event loop that gets closed, but async
-        # components (tokenizer pool, serving engines) bind futures to that loop.
-        # When Runpod's serverless handler runs in its own event loop, those futures
-        # are "attached to a different loop" causing RuntimeError.
-        # This affects all configurations, not just LoRA.
         self._engines_initialized = False
         if self.lora_adapters:
             logging.info(f"LoRA mode: {len(self.lora_adapters)} adapter(s) will load on first request")
@@ -217,18 +221,55 @@ class OpenAIvLLMEngine(vLLMEngine):
         return adapters
 
     async def _ensure_engines_initialized(self):
-        """Initialize engines on first request to avoid event loop mismatch.
-
-        In Runpod Serverless, the startup code runs outside the handler's event
-        loop. Deferring initialization to the first request ensures all async
-        components (tokenizer pool, serving engines, LoRA state) are created in
-        the correct event loop context.
-        """
         if not self._engines_initialized:
             logging.info("Initializing OpenAI serving engines...")
             await self._initialize_engines()
             self._engines_initialized = True
             logging.info("OpenAI serving engines initialized successfully")
+
+    def _create_serving_render(self, chat_template):
+        """Create OpenAIServingRender with nightly vLLM API."""
+        if OpenAIServingRender is None:
+            logging.warning("OpenAIServingRender not available, skipping")
+            return None
+
+        # Try creating with full parameters (nightly vLLM)
+        try:
+            renderer = getattr(self.llm, 'renderer', None)
+            model_registry = getattr(self.serving_models, 'registry', None)
+            
+            return OpenAIServingRender(
+                model_config=self.llm.model_config,
+                renderer=renderer,
+                model_registry=model_registry,
+                request_logger=None,
+                chat_template=chat_template,
+                chat_template_content_format="auto",
+                trust_request_chat_template=os.getenv('TRUST_REQUEST_CHAT_TEMPLATE', 'false').lower() == 'true',
+                enable_auto_tools=os.getenv('ENABLE_AUTO_TOOL_CHOICE', 'false').lower() == 'true',
+                exclude_tools_when_tool_choice_none=os.getenv('EXCLUDE_TOOLS_WHEN_TOOL_CHOICE_NONE', 'false').lower() == 'true',
+                tool_parser=os.getenv('TOOL_CALL_PARSER', "") or None,
+                reasoning_parser=os.getenv('REASONING_PARSER', "") or None,
+            )
+        except TypeError as e:
+            logging.warning(f"Full OpenAIServingRender init failed ({e}), trying minimal init...")
+            # Fallback: try with fewer parameters
+            try:
+                return OpenAIServingRender(
+                    model_config=self.llm.model_config,
+                    renderer=getattr(self.llm, 'renderer', None),
+                    model_registry=getattr(self.serving_models, 'registry', None),
+                    request_logger=None,
+                    chat_template=chat_template,
+                    chat_template_content_format="auto",
+                )
+            except TypeError as e2:
+                logging.warning(f"Minimal OpenAIServingRender init also failed ({e2}), trying no-arg init...")
+                try:
+                    return OpenAIServingRender()
+                except Exception as e3:
+                    logging.error(f"All OpenAIServingRender init attempts failed: {e3}")
+                    return None
 
     async def _initialize_engines(self):
         self.model_config = self.llm.model_config
@@ -247,10 +288,13 @@ class OpenAIvLLMEngine(vLLMEngine):
         chat_template = None
         if self.tokenizer and hasattr(self.tokenizer, 'tokenizer'):
             chat_template = self.tokenizer.tokenizer.chat_template
+
+        # Create OpenAIServingRender (required by nightly vLLM)
+        self.openai_serving_render = self._create_serving_render(chat_template)
         
-        self.chat_engine = OpenAIServingChat(
+        # Build chat engine kwargs - conditionally include openai_serving_render
+        chat_kwargs = dict(
             engine_client=self.llm, 
-            openai_serving_render=None,
             models=self.serving_models,
             response_role=self.response_role,
             request_logger=None,
@@ -266,15 +310,24 @@ class OpenAIvLLMEngine(vLLMEngine):
             enable_force_include_usage=os.getenv('ENABLE_FORCE_INCLUDE_USAGE', 'false').lower() == 'true',
             enable_log_outputs=os.getenv('ENABLE_LOG_OUTPUTS', 'false').lower() == 'true',
         )
-        self.completion_engine = OpenAIServingCompletion(
+        if self.openai_serving_render is not None:
+            chat_kwargs['openai_serving_render'] = self.openai_serving_render
+
+        self.chat_engine = OpenAIServingChat(**chat_kwargs)
+
+        # Build completion engine kwargs
+        completion_kwargs = dict(
             engine_client=self.llm,
-            openai_serving_render=None,
             models=self.serving_models,
             request_logger=None,
             return_tokens_as_token_ids=os.getenv('RETURN_TOKENS_AS_TOKEN_IDS', 'false').lower() == 'true',
             enable_prompt_tokens_details=os.getenv('ENABLE_PROMPT_TOKENS_DETAILS', 'false').lower() == 'true',
             enable_force_include_usage=os.getenv('ENABLE_FORCE_INCLUDE_USAGE', 'false').lower() == 'true',
         )
+        if self.openai_serving_render is not None:
+            completion_kwargs['openai_serving_render'] = self.openai_serving_render
+
+        self.completion_engine = OpenAIServingCompletion(**completion_kwargs)
 
         if hasattr(self.chat_engine, 'warmup'):
             await self.chat_engine.warmup()
@@ -342,4 +395,3 @@ class OpenAIvLLMEngine(vLLMEngine):
                 if self.raw_openai_output:
                     batch = "".join(batch)
                 yield batch
-            
